@@ -1,0 +1,205 @@
+import re
+from dataclasses import dataclass
+from typing import Any, Self
+
+from .error import SecretsError
+
+safe_name_regex = re.compile("^[a-zA-Z0-9:_\\.-]+$")
+meta_file_name = ".nixos-secrets-metadata"  # In this file to prevent cyclic imports
+
+
+@dataclass(frozen=True)
+class SecretsPromptBackend:
+    name: str
+    ask: str
+
+    @staticmethod
+    def from_json(name: str, json: Any) -> "SecretsPromptBackend":
+        return SecretsPromptBackend(name=name, ask=json["ask"])
+
+
+@dataclass(frozen=True)
+class SecretsPrompt:
+    name: str
+    label: str
+    description: str | None
+    backend: str
+
+    @staticmethod
+    def from_json(name: str, json: Any) -> "SecretsPrompt":
+        return SecretsPrompt(
+            name=name,
+            label=json["label"],
+            description=json["description"],
+            backend=json["backend"],
+        )
+
+
+@dataclass(frozen=True)
+class SecretsStoreBackend:
+    name: str
+    get: str
+    set: str
+    delete: str | None
+    list: str
+    fixup: str | None
+    deployRemote: str | None
+    deployLocal: str | None
+
+    @staticmethod
+    def from_json(name: str, json: Any) -> "SecretsStoreBackend":
+        return SecretsStoreBackend(
+            name=name,
+            get=json["get"],
+            set=json["set"],
+            delete=json.get("delete"),
+            list=json["list"],
+            fixup=json.get("fixup"),
+            deployRemote=json["deploy"].get("remote"),
+            deployLocal=json["deploy"].get("local"),
+        )
+
+
+@dataclass(frozen=True)
+class SecretsFile:
+    name: str
+    backend: str
+    deploy: bool = False
+
+    @staticmethod
+    def from_json(name: str, json: Any) -> "SecretsFile":
+        if safe_name_regex.search(name) is None:
+            raise SecretsError(
+                f"File '{name}' does not have a valid name. Currently, only alphanumeric characters, dashes, underscores, and dots are allowed."
+            )
+
+        if name == meta_file_name:
+            raise SecretsError(f"Files cannot use the reserved name '{meta_file_name}'")
+
+        return SecretsFile(
+          name=name,
+          backend=json["backend"],
+          deploy=json["deploy"]
+        )
+
+
+@dataclass(frozen=True)
+class SecretsSecret:
+    name: str
+    metaBackend: str
+    generate: str | None
+    dependencies: list[str]
+    prompts: dict[str, SecretsPrompt]
+    files: dict[str, SecretsFile]
+
+    @staticmethod
+    def from_json(name: str, json: Any) -> "SecretsSecret":
+        if safe_name_regex.search(name) is None:
+            raise SecretsError(
+                f"Secret '{name}' does not have a valid name. Currently, only alphanumeric characters, dashes, underscores, and dots are allowed."
+            )
+
+        result = SecretsSecret(
+            name=name,
+            metaBackend=json["meta"]["backend"],
+            generate=json["generate"],
+            dependencies=json["dependencies"],
+            prompts={},
+            files={},
+        )
+
+        for k, v in json["prompts"].items():
+            result.prompts[k] = SecretsPrompt.from_json(k, v)
+
+        for k, v in json["files"].items():
+            result.files[k] = SecretsFile.from_json(k, v)
+
+        if not result.files:
+            raise SecretsError(f"Secret '{name}' has no associated files")
+
+        if result.generate is None and result.dependencies:
+            raise SecretsError(
+                f"Secret '{name}' has associated dependencies without a corresponding generator script"
+            )
+
+        if result.generate is None and result.prompts:
+            raise SecretsError(
+                f"Secret '{name}' has associated prompts without a corresponding generator script"
+            )
+
+        return result
+
+
+@dataclass(frozen=True)
+class SecretsConfig:
+    generators: dict[str, SecretsSecret]
+    storeBackends: dict[str, SecretsStoreBackend]
+    promptBackends: dict[str, SecretsPromptBackend]
+
+    @staticmethod
+    def from_json(json: Any) -> "SecretsConfig":
+        result = SecretsConfig(generators={}, storeBackends={}, promptBackends={})
+
+        for k, v in json["backends"]["prompt"].items():
+            result.promptBackends[k] = SecretsPromptBackend.from_json(k, v)
+
+        for k, v in json["backends"]["store"].items():
+            result.storeBackends[k] = SecretsStoreBackend.from_json(k, v)
+
+        for k, v in json["store"].items():
+            result.generators[k] = SecretsSecret.from_json(k, v)
+
+        referencedGenerators: set[str] = set()
+        referencedStoreBackends: set[str] = set()
+        referencedPromptBackends: set[str] = set()
+
+        for gen in result.generators.values():
+            referencedGenerators.update(gen.dependencies)
+            referencedStoreBackends.add(gen.metaBackend)
+            for file in gen.files.values():
+              referencedStoreBackends.add(file.backend)
+
+        for secret in result.generators.values():
+            for prompt in secret.prompts.values():
+                referencedPromptBackends.add(prompt.backend)
+
+        if missingPromptBackends := referencedPromptBackends - set(
+            result.promptBackends.keys()
+        ):
+            missingList = ", ".join(sorted(missingPromptBackends))
+            raise SecretsError(
+                f"The following prompt backends are referenced but not defined: {missingList}"
+            )
+
+        if missingStoreBackends := referencedStoreBackends - set(
+            result.storeBackends.keys()
+        ):
+            missingList = ", ".join(sorted(missingStoreBackends))
+            raise SecretsError(
+                f"The following generator backends are referenced but not defined: {missingList}"
+            )
+
+        if missingGenerators := referencedGenerators - set(result.generators.keys()):
+            missingList = ", ".join(sorted(missingGenerators))
+            raise SecretsError(
+                f"The following generators are referenced but not defined: {missingList}"
+            )
+
+        return result
+
+    def files_for_backend(
+        self: Self,
+        backend: SecretsStoreBackend,
+        deployed_only: bool = False,
+    ) -> list[tuple[str, str]]:
+        files = []
+        for generator in self.generators.values():
+            for file in generator.files.values():
+                if file.backend != backend.name:
+                    continue
+
+                # Checks that deployed_only implies file.deploy
+                if not deployed_only or deployed_only and file.deploy:
+                    files.append((generator.name, file.name))
+
+        return files
